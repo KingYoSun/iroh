@@ -12,7 +12,7 @@ use std::{
 };
 
 use n0_error::{e, stack_error};
-use portable_atomic::{AtomicU64, Ordering};
+use rand::Rng;
 use rustc_hash::FxHashMap;
 use tracing::trace;
 
@@ -54,20 +54,14 @@ pub(crate) const DEFAULT_FAKE_ADDR: SocketAddrV6 = SocketAddrV6::new(
 /// involve ports, so we use a dummy fixed port when creating socket addresses.
 const MAPPED_PORT: u16 = 12345;
 
-/// Counter to always generate unique addresses for [`RelayMappedAddr`].
-static RELAY_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Counter to always generate unique addresses for [`EndpointIdMappedAddr`].
-static ENDPOINT_ID_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
-/// Counter to always generate unique addresses for [`CustomMappedAddr`].
-static CUSTOM_ADDR_COUNTER: AtomicU64 = AtomicU64::new(1);
-
 /// Generic mapped address.
 ///
 /// Allows implementing [`AddrMap`].
 pub(crate) trait MappedAddr {
     /// Generates a new mapped address in the IPv6 Unique Local Address space.
+    ///
+    /// The host bits are random so a remote peer cannot guess one of our live mapped
+    /// addresses (uniqueness is ensured by [`AddrMap::get`]).
     fn generate() -> Self;
 
     /// Returns a consistent [`SocketAddr`] for the mapped addr.
@@ -144,9 +138,7 @@ impl MappedAddr for EndpointIdMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&ENDPOINT_ID_SUBNET);
-
-        let counter = ENDPOINT_ID_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -207,9 +199,7 @@ impl MappedAddr for RelayMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&RELAY_MAPPED_SUBNET);
-
-        let counter = RELAY_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -269,9 +259,7 @@ impl MappedAddr for CustomMappedAddr {
         addr[0] = ADDR_PREFIXL;
         addr[1..6].copy_from_slice(&ADDR_GLOBAL_ID);
         addr[6..8].copy_from_slice(&CUSTOM_MAPPED_SUBNET);
-
-        let counter = CUSTOM_ADDR_COUNTER.fetch_add(1, Ordering::Relaxed);
-        addr[8..16].copy_from_slice(&counter.to_be_bytes());
+        rand::rng().fill_bytes(&mut addr[8..16]);
 
         Self(Ipv6Addr::from(addr))
     }
@@ -350,7 +338,12 @@ where
         match inner.addrs.get(key) {
             Some(addr) => *addr,
             None => {
-                let addr = V::generate();
+                let addr = loop {
+                    let candidate = V::generate();
+                    if !inner.lookup.contains_key(&candidate) {
+                        break candidate;
+                    }
+                };
                 inner.addrs.insert(key.clone(), addr);
                 inner.lookup.insert(addr, key.clone());
                 trace!(?addr, ?key, "generated new addr");
@@ -359,10 +352,36 @@ where
         }
     }
 
+    /// Returns the number of entries in this address map.
+    pub(super) fn len(&self) -> usize {
+        self.inner.lock().expect("poisoned").addrs.len()
+    }
+
     /// Performs the reverse lookup.
     pub(super) fn lookup(&self, addr: &V) -> Option<K> {
         let inner = self.inner.lock().expect("poisoned");
         inner.lookup.get(addr).cloned()
+    }
+
+    /// Removes the [`MappedAddr`] if present, returning it.
+    pub(super) fn remove(&self, key: &K) -> Option<V> {
+        let mut inner = self.inner.lock().expect("poisoned");
+        inner.addrs.remove(key).inspect(|addr| {
+            inner.lookup.remove(addr);
+        })
+    }
+
+    /// Retains the elements for which `f` returns `true`.
+    pub(super) fn retain(&self, mut f: impl FnMut(&K, &V) -> bool) {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let AddrMapInner { addrs, lookup } = &mut *inner;
+        addrs.retain(|k: &K, v| {
+            let retain = f(k, v);
+            if !retain {
+                lookup.remove(v);
+            }
+            retain
+        });
     }
 }
 
@@ -379,5 +398,31 @@ impl<K, V> Default for AddrMapInner<K, V> {
             addrs: Default::default(),
             lookup: Default::default(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_addrmap_remove() {
+        let map: AddrMap<u8, EndpointIdMappedAddr> = AddrMap::default();
+        let addr = map.get(&0);
+        assert!(map.lookup(&addr).is_some(), "reverse lookup not found");
+
+        map.remove(&0);
+        assert!(map.lookup(&addr).is_none(), "reverse lookup not cleared");
+    }
+
+    #[test]
+    fn test_addrmap_retain() {
+        let map: AddrMap<u8, EndpointIdMappedAddr> = AddrMap::default();
+        map.get(&0);
+        let addr1 = map.get(&1);
+        assert!(map.lookup(&addr1).is_some(), "reverse lookup not found");
+
+        map.retain(|k, _a| *k == 0);
+        assert!(map.lookup(&addr1).is_none(), "reverse lookup not cleared");
     }
 }

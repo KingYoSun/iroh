@@ -23,6 +23,21 @@ relays, including:
 
 Used in [iroh], created with love by the [n0 team](https://n0.computer/).
 
+## Build the server
+
+You can build an optimised release of `iroh-relay` by running `cargo build`
+with the appropriate flags from the workspace parent directory as follows.
+
+```
+cd ../
+cargo build \
+  --profile optimized-release \
+  --package iroh-relay \
+  --features server
+```
+
+You will find the optimised binary at `target/optimized-release/iroh-relay`.
+
 ## Access control
 
 The relay server supports several access control modes, configured via the
@@ -141,9 +156,9 @@ This will start a relay server with a self-signed TLS certificate, listening on 
 This project is licensed under either of
 
  * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
-   http://www.apache.org/licenses/LICENSE-2.0)
+   https://www.apache.org/licenses/LICENSE-2.0)
  * MIT license ([LICENSE-MIT](LICENSE-MIT) or
-   http://opensource.org/licenses/MIT)
+   https://opensource.org/licenses/MIT)
 
 at your option.
 
