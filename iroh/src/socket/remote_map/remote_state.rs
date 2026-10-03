@@ -6,7 +6,7 @@ use std::{
     task::Poll,
 };
 
-use iroh_base::{EndpointId, TransportAddr};
+use iroh_base::{CustomAddr, EndpointId, TransportAddr};
 use n0_error::StackResultExt;
 use n0_future::{
     FuturesUnordered, FuturesUnorderedBounded, MaybeFuture, MergeUnbounded, Stream, StreamExt,
@@ -123,6 +123,10 @@ struct State {
     ///
     /// These are our local addresses and any reflexive transport addresses.
     local_direct_addrs: n0_watcher::Direct<BTreeSet<DirectAddr>>,
+    /// The local addresses of our custom transports.
+    ///
+    /// A custom path whose local address is withdrawn is closed right away.
+    local_custom_addrs: transports::CustomTransportsWatcher,
     /// The mapped addresses for this endpoint.
     mapped_addrs: MappedAddrs,
     /// Address lookup service, cloned from the socket.
@@ -179,6 +183,7 @@ impl RemoteStateActor {
     pub(super) fn new(
         endpoint_id: EndpointId,
         local_direct_addrs: n0_watcher::Direct<BTreeSet<DirectAddr>>,
+        local_custom_addrs: transports::CustomTransportsWatcher,
         mapped_addrs: MappedAddrs,
         metrics: Arc<SocketMetrics>,
         address_lookup: AddressLookupServices,
@@ -190,6 +195,7 @@ impl RemoteStateActor {
                 endpoint_id,
                 metrics: metrics.clone(),
                 local_direct_addrs,
+                local_custom_addrs,
                 mapped_addrs,
                 address_lookup,
                 connections_close: Default::default(),
@@ -300,6 +306,13 @@ impl RemoteStateActor {
                     self.update_local_direct_address();
                     trace!("local addrs updated, triggering holepunching");
                     self.trigger_holepunching();
+                }
+                res = self.state.local_custom_addrs.updated() => {
+                    if let Err(n0_watcher::Disconnected) = res {
+                        trace!("custom address watcher disconnected, shutting down");
+                        break;
+                    }
+                    self.close_withdrawn_custom_paths();
                 }
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
@@ -512,6 +525,46 @@ impl RemoteStateActor {
             update_qnt_candidates(&conn, &local_addrs);
         }
         // todo: trace
+    }
+
+    /// Closes the custom paths whose local address our custom transports withdrew.
+    ///
+    /// A custom transport withdraws an address once it can no longer carry datagrams on it
+    /// (e.g. its session ended).  Until the path idle timeout the dead path would stay
+    /// selected and all data sent to it would be dropped.  Closing it sends PATH_ABANDON to
+    /// the remote, and the abandoned event selects a path again.
+    fn close_withdrawn_custom_paths(&mut self) {
+        let local: BTreeSet<CustomAddr> = self
+            .state
+            .local_custom_addrs
+            .get()
+            .into_iter()
+            .flatten()
+            .collect();
+        for conn_state in self.connections.values() {
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            for path_id in conn_state.paths.keys() {
+                let Some(path) = conn.path(*path_id) else {
+                    continue;
+                };
+                let withdrawn = path
+                    .network_path()
+                    .ok()
+                    .and_then(|tuple| self.state.mapped_addrs.to_transport_tuple(&tuple))
+                    .is_some_and(|tuple| {
+                        matches!(tuple, transports::FourTuple::Custom { local: Some(addr), .. }
+                            if !local.contains(&addr))
+                    });
+                if withdrawn {
+                    debug!(%path_id, "closing custom path with a withdrawn local address");
+                    if let Err(err) = path.close() {
+                        debug!(%path_id, ?err, "failed to close custom path");
+                    }
+                }
+            }
+        }
     }
 
     /// Triggers holepunching to the remote endpoint.
