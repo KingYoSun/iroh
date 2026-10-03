@@ -62,7 +62,7 @@ pub(crate) struct Transports {
 /// Combined watcher type for all ip transports
 type IpTransportsWatcher = n0_watcher::Join<SocketAddr, n0_watcher::Direct<SocketAddr>>;
 /// Combined watcher type for all custom transports
-type CustomTransportsWatcher =
+pub(super) type CustomTransportsWatcher =
     n0_watcher::Join<Vec<CustomAddr>, n0_watcher::Direct<Vec<CustomAddr>>>;
 /// Combined watcher type for all relay transports
 type RelayTransportsWatcher = n0_watcher::Join<
@@ -377,6 +377,11 @@ impl Transports {
     pub(super) fn home_relay_watch(&self) -> HomeRelayWatcher {
         n0_watcher::Join::new(self.relay.iter().map(|t| t.my_relay_status()))
             .map(|v| v.into_iter().flatten().collect())
+    }
+
+    /// Watch for the local addresses of the custom transports.
+    pub(super) fn custom_addrs_watch(&self) -> CustomTransportsWatcher {
+        n0_watcher::Join::new(self.custom.iter().map(|t| t.watch_local_addrs()))
     }
 
     #[cfg(not(wasm_browser))]
