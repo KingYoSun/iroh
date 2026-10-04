@@ -494,6 +494,9 @@ impl RemoteStateActor {
             }
         }
         self.trigger_holepunching();
+        // The connection may have been established over a custom path whose local address
+        // was withdrawn before the connection was added here.
+        self.close_withdrawn_custom_paths();
         self.select_path();
         tx.send(path_state_receiver).ok();
     }
@@ -936,12 +939,17 @@ fn is_withdrawn_custom(path: &transports::FourTuple, live: &BTreeSet<CustomAddr>
 }
 
 impl State {
-    /// The local addresses our custom transports currently offer.
-    fn live_custom_addrs(&mut self) -> BTreeSet<CustomAddr> {
+    /// The local addresses our custom transports currently offer, as last taken by the
+    /// watcher branch of the run loop.
+    ///
+    /// Reads with [`Watcher::peek`]: only that branch takes an update from the watcher, so
+    /// that every withdrawal runs [`RemoteStateActor::close_withdrawn_custom_paths`].
+    fn live_custom_addrs(&self) -> BTreeSet<CustomAddr> {
         self.local_custom_addrs
-            .get()
-            .into_iter()
+            .peek()
+            .iter()
             .flatten()
+            .cloned()
             .collect()
     }
 
@@ -1743,6 +1751,33 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 #[cfg(all(test, not(wasm_browser)))]
 mod tests {
     use super::*;
+
+    /// A handler reading the custom addresses must leave the update to the watcher branch,
+    /// which closes the custom paths on withdrawn addresses.
+    #[tokio::test]
+    async fn reading_custom_addrs_leaves_the_update_to_the_watcher_branch() {
+        let direct = n0_watcher::Watchable::new(BTreeSet::new());
+        let custom = n0_watcher::Watchable::new(vec![CustomAddr::from_parts(1, b"session")]);
+        let mut actor = RemoteStateActor::new(
+            iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
+            direct.watch(),
+            n0_watcher::Join::new([custom.watch()].into_iter()),
+            MappedAddrs::default(),
+            Arc::new(SocketMetrics::default()),
+            AddressLookupServices::default(),
+            Arc::new(crate::socket::biased_rtt_path_selector::BiasedRttPathSelector::default()),
+        );
+        custom.set(Vec::new()).ok();
+        actor.select_path();
+        let updated = time::timeout(
+            Duration::from_millis(100),
+            actor.state.local_custom_addrs.updated(),
+        )
+        .await
+        .expect("the withdrawal was taken outside the watcher branch")
+        .unwrap();
+        assert_eq!(updated, vec![Vec::<CustomAddr>::new()]);
+    }
 
     #[tokio::test]
     async fn blocked_relay_does_not_delay_direct_initial() {
