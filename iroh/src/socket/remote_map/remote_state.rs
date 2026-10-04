@@ -939,17 +939,17 @@ fn is_withdrawn_custom(path: &transports::FourTuple, live: &BTreeSet<CustomAddr>
 }
 
 impl State {
-    /// The local addresses our custom transports currently offer, as last taken by the
-    /// watcher branch of the run loop.
+    /// The local addresses our custom transports currently offer.
     ///
-    /// Reads with [`Watcher::peek`]: only that branch takes an update from the watcher, so
-    /// that every withdrawal runs [`RemoteStateActor::close_withdrawn_custom_paths`].
+    /// Reads the latest value from a clone of the watcher: only the watcher branch of the
+    /// run loop takes an update from the watcher itself, so that every withdrawal runs
+    /// [`RemoteStateActor::close_withdrawn_custom_paths`].
     fn live_custom_addrs(&self) -> BTreeSet<CustomAddr> {
         self.local_custom_addrs
-            .peek()
-            .iter()
+            .clone()
+            .get()
+            .into_iter()
             .flatten()
-            .cloned()
             .collect()
     }
 
@@ -1752,12 +1752,14 @@ async fn maybe_next<S: Stream + Unpin>(maybe_stream: Option<&mut S>) -> Option<O
 mod tests {
     use super::*;
 
-    /// A handler reading the custom addresses must leave the update to the watcher branch,
-    /// which closes the custom paths on withdrawn addresses.
+    /// A handler reading the custom addresses sees the latest ones, and leaves the update to
+    /// the watcher branch, which closes the custom paths on withdrawn addresses.
     #[tokio::test]
-    async fn reading_custom_addrs_leaves_the_update_to_the_watcher_branch() {
+    async fn reading_custom_addrs_sees_the_latest_and_leaves_the_update_to_the_watcher_branch() {
         let direct = n0_watcher::Watchable::new(BTreeSet::new());
-        let custom = n0_watcher::Watchable::new(vec![CustomAddr::from_parts(1, b"session")]);
+        let withdrawn = CustomAddr::from_parts(1, b"withdrawn");
+        let added = CustomAddr::from_parts(1, b"added");
+        let custom = n0_watcher::Watchable::new(vec![withdrawn]);
         let mut actor = RemoteStateActor::new(
             iroh_base::SecretKey::from_bytes(&[1; 32]).public(),
             direct.watch(),
@@ -1767,16 +1769,21 @@ mod tests {
             AddressLookupServices::default(),
             Arc::new(crate::socket::biased_rtt_path_selector::BiasedRttPathSelector::default()),
         );
-        custom.set(Vec::new()).ok();
+        custom.set(vec![added.clone()]).ok();
+        assert_eq!(
+            actor.state.live_custom_addrs(),
+            BTreeSet::from([added.clone()]),
+            "a handler reads an outdated set of custom addresses"
+        );
         actor.select_path();
         let updated = time::timeout(
             Duration::from_millis(100),
             actor.state.local_custom_addrs.updated(),
         )
         .await
-        .expect("the withdrawal was taken outside the watcher branch")
+        .expect("the change was taken outside the watcher branch")
         .unwrap();
-        assert_eq!(updated, vec![Vec::<CustomAddr>::new()]);
+        assert_eq!(updated, vec![vec![added]]);
     }
 
     #[tokio::test]
