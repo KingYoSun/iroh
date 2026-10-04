@@ -75,6 +75,14 @@ const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
 // QUIC retransmits dropped Initials; a blocked transport must not retain them indefinitely.
 const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a connection whose only open path is a withdrawn custom path is kept.
+///
+/// Such a path cannot be closed (it is the last one) and no other path can be opened
+/// when the remote's connection IDs never arrived over it, so the connection would
+/// otherwise stall until the QUIC idle timeout.  Closing it lets its users reconnect,
+/// and new connections start on a path that still works.
+const STUCK_CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_DATAGRAM_SEND_TASKS: usize = 16;
 
 /// A stream of events from all paths for all connections.
@@ -168,6 +176,9 @@ struct State {
     ///
     /// They failed to open because we did not have enough CIDs issued by the remote.
     pending_open_paths: VecDeque<transports::FourTuple>,
+    /// Connections left with a withdrawn custom path as their only open path, and when
+    /// to close them if no other path opened by then (see [`STUCK_CONNECTION_TIMEOUT`]).
+    stuck_connections: FxHashMap<ConnId, Instant>,
 
     // Internal state - address lookup
     //
@@ -207,6 +218,7 @@ impl RemoteStateActor {
                 scheduled_holepunch: None,
                 scheduled_open_path: None,
                 pending_open_paths: VecDeque::new(),
+                stuck_connections: Default::default(),
                 address_lookup_stream: None,
                 path_selector,
             },
@@ -268,6 +280,11 @@ impl RemoteStateActor {
                 None => MaybeFuture::None,
             };
             n0_future::pin!(scheduled_hp);
+            let scheduled_stuck_close = match self.state.stuck_connections.values().min() {
+                Some(when) => MaybeFuture::Some(time::sleep_until(*when)),
+                None => MaybeFuture::None,
+            };
+            n0_future::pin!(scheduled_stuck_close);
             if !self.is_idle(&inbox) {
                 idle_timeout
                     .as_mut()
@@ -313,6 +330,12 @@ impl RemoteStateActor {
                         break;
                     }
                     self.close_withdrawn_custom_paths();
+                    // A withdrawn custom path left open as the last path of a connection
+                    // must not stay selected.
+                    self.select_path();
+                }
+                _ = &mut scheduled_stuck_close => {
+                    self.close_stuck_connections();
                 }
                 _ = &mut scheduled_path_open => {
                     trace!("triggering scheduled path_open");
@@ -509,6 +532,7 @@ impl RemoteStateActor {
             self.state.metrics.num_conns_closed.inc();
             conn_state.path_state.close(closed);
         }
+        self.state.stuck_connections.remove(&conn_id);
         if self.connections.is_empty() {
             trace!("last connection closed - clearing selected_path");
             self.state.selected_path = None;
@@ -533,15 +557,13 @@ impl RemoteStateActor {
     /// (e.g. its session ended).  Until the path idle timeout the dead path would stay
     /// selected and all data sent to it would be dropped.  Closing it sends PATH_ABANDON to
     /// the remote, and the abandoned event selects a path again.
+    ///
+    /// A withdrawn custom path that is the last open path of a connection cannot be
+    /// closed; the connection is closed after [`STUCK_CONNECTION_TIMEOUT`] unless another
+    /// path opens by then.
     fn close_withdrawn_custom_paths(&mut self) {
-        let local: BTreeSet<CustomAddr> = self
-            .state
-            .local_custom_addrs
-            .get()
-            .into_iter()
-            .flatten()
-            .collect();
-        for conn_state in self.connections.values() {
+        let local = self.state.live_custom_addrs();
+        for (conn_id, conn_state) in self.connections.iter() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
@@ -559,10 +581,48 @@ impl RemoteStateActor {
                     });
                 if withdrawn {
                     debug!(%path_id, "closing custom path with a withdrawn local address");
-                    if let Err(err) = path.close() {
-                        debug!(%path_id, ?err, "failed to close custom path");
+                    match path.close() {
+                        Err(noq_proto::ClosePathError::LastOpenPath) => {
+                            self.state
+                                .stuck_connections
+                                .entry(*conn_id)
+                                .or_insert_with(|| Instant::now() + STUCK_CONNECTION_TIMEOUT);
+                        }
+                        Err(err) => debug!(%path_id, ?err, "failed to close custom path"),
+                        Ok(()) => {}
                     }
                 }
+            }
+        }
+    }
+
+    /// Closes the connections whose only open paths are still withdrawn custom paths
+    /// once their [`STUCK_CONNECTION_TIMEOUT`] passed.
+    fn close_stuck_connections(&mut self) {
+        let now = Instant::now();
+        let local = self.state.live_custom_addrs();
+        let due: Vec<ConnId> = self
+            .state
+            .stuck_connections
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(conn_id, _)| *conn_id)
+            .collect();
+        for conn_id in due {
+            self.state.stuck_connections.remove(&conn_id);
+            let Some(conn_state) = self.connections.get(&conn_id) else {
+                continue;
+            };
+            let Some(conn) = conn_state.handle.upgrade() else {
+                continue;
+            };
+            if conn_state
+                .paths
+                .values()
+                .all(|path| is_withdrawn_custom(path, &local))
+            {
+                debug!(%conn_id, "closing a connection left with only a withdrawn custom path");
+                conn.close(0u32.into(), b"custom path withdrawn");
             }
         }
     }
@@ -718,9 +778,21 @@ impl RemoteStateActor {
     /// direct paths are closed for all connections.
     #[instrument(skip_all)]
     fn select_path(&mut self) {
+        // A custom path whose local address was withdrawn can no longer carry datagrams:
+        // neither keep it nor pick it, so that new connections start on a working path.
+        let local = self.state.live_custom_addrs();
+        if self
+            .state
+            .selected_path
+            .as_ref()
+            .is_some_and(|path| is_withdrawn_custom(path, &local))
+        {
+            debug!("deselecting a withdrawn custom path");
+            self.state.selected_path = None;
+        }
         let current_path = self.state.selected_path.as_ref();
         let selected_addr = {
-            let ctx = PathSelectionContext::new(current_path, &self.connections);
+            let ctx = PathSelectionContext::new(current_path, &self.connections, &local);
             self.state.path_selector.select(&ctx).selected().cloned()
         };
 
@@ -855,7 +927,24 @@ impl RemoteStateActor {
     }
 }
 
+/// Whether `path` is a custom path whose local address our custom transports withdrew.
+///
+/// A custom path with an unknown local address is not considered withdrawn; the remote's
+/// PATH_ABANDON closes it.
+fn is_withdrawn_custom(path: &transports::FourTuple, live: &BTreeSet<CustomAddr>) -> bool {
+    matches!(path, transports::FourTuple::Custom { local: Some(addr), .. } if !live.contains(addr))
+}
+
 impl State {
+    /// The local addresses our custom transports currently offer.
+    fn live_custom_addrs(&mut self) -> BTreeSet<CustomAddr> {
+        self.local_custom_addrs
+            .get()
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
     /// Handles [`RemoteStateMessage::SendDatagram`].
     fn handle_msg_send_datagram(
         &mut self,
@@ -1409,7 +1498,12 @@ pub struct PathSelectionContext<'a> {
 /// (for unit-testing selectors).
 #[derive(Debug)]
 enum PathsSource<'a> {
-    Live(&'a FxHashMap<ConnId, ConnectionState>),
+    /// The live connections, and the local addresses our custom transports still offer
+    /// (custom paths on withdrawn local addresses are not candidates).
+    Live(
+        &'a FxHashMap<ConnId, ConnectionState>,
+        &'a BTreeSet<CustomAddr>,
+    ),
     #[cfg(test)]
     Test(Vec<PathSelectionData<'a>>),
 }
@@ -1419,10 +1513,11 @@ impl<'a> PathSelectionContext<'a> {
     fn new(
         current: Option<&'a transports::FourTuple>,
         connections: &'a FxHashMap<ConnId, ConnectionState>,
+        live_custom_addrs: &'a BTreeSet<CustomAddr>,
     ) -> Self {
         Self {
             current,
-            source: PathsSource::Live(connections),
+            source: PathsSource::Live(connections, live_custom_addrs),
         }
     }
 
@@ -1449,14 +1544,18 @@ impl<'a> PathSelectionContext<'a> {
     /// connections to the remote.  Selectors that care should aggregate as appropriate.
     pub fn paths(&self) -> Box<dyn Iterator<Item = PathSelectionData<'a>> + '_> {
         match &self.source {
-            PathsSource::Live(connections) => Box::new(
+            PathsSource::Live(connections, live) => Box::new(
                 connections
                     .values()
                     .filter_map(|state| state.handle.upgrade().map(|conn| (state, conn)))
-                    .flat_map(|(state, conn)| {
-                        state.paths.iter().map(move |(path_id, addr)| {
-                            PathSelectionData::live(addr, *path_id, conn.clone())
-                        })
+                    .flat_map(move |(state, conn)| {
+                        state
+                            .paths
+                            .iter()
+                            .filter(move |(_, addr)| !is_withdrawn_custom(addr, live))
+                            .map(move |(path_id, addr)| {
+                                PathSelectionData::live(addr, *path_id, conn.clone())
+                            })
                     }),
             ),
             #[cfg(test)]
