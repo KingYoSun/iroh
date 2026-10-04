@@ -660,6 +660,9 @@ impl RemoteStateActor {
                 self.state
                     .register_and_configure_path(conn_id, conn_state, &path);
                 self.select_path();
+                // A withdrawn custom path that was the last open path of a connection could
+                // not be closed; now that another path is open, close it.
+                self.close_withdrawn_custom_paths();
             }
             NoqPathEvent::Abandoned { id, reason, .. } => {
                 // Remove abandoned path from the conn state.
