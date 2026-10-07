@@ -76,9 +76,10 @@ const ACTOR_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 // QUIC retransmits dropped Initials; a blocked transport must not retain them indefinitely.
 const DATAGRAM_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// How long a connection whose only open path is a withdrawn custom path is kept.
+/// How long a connection whose only established path is a withdrawn custom path is kept.
 ///
-/// Such a path cannot be closed (it is the last one) and no other path can be opened
+/// Such a path is not closed until another path is established (see
+/// [`RemoteStateActor::close_withdrawn_custom_paths`]), and no other path can be opened
 /// when the remote's connection IDs never arrived over it, so the connection would
 /// otherwise stall until the QUIC idle timeout.  Closing it lets its users reconnect,
 /// and new connections start on a path that still works.
@@ -561,15 +562,24 @@ impl RemoteStateActor {
     /// selected and all data sent to it would be dropped.  Closing it sends PATH_ABANDON to
     /// the remote, and the abandoned event selects a path again.
     ///
-    /// A withdrawn custom path that is the last open path of a connection cannot be
-    /// closed; the connection is closed after [`STUCK_CONNECTION_TIMEOUT`] unless another
-    /// path opens by then.
+    /// A withdrawn custom path is closed only while the connection has another established
+    /// path.  Without one, noq sends the PATH_ABANDON on the dead path itself and never
+    /// retransmits it, and a side declares the packets in flight on an abandoned path lost
+    /// only after the remote's PATH_ABANDON arrives: if both sides abandon such a path before
+    /// another path is validated, the data sent on it is never retransmitted and the
+    /// connection stalls.  Until another path is established the withdrawn custom path is
+    /// kept like the last open path: the connection is closed after
+    /// [`STUCK_CONNECTION_TIMEOUT`] unless another path is established by then.
     fn close_withdrawn_custom_paths(&mut self) {
         let local = self.state.live_custom_addrs();
         for (conn_id, conn_state) in self.connections.iter() {
             let Some(conn) = conn_state.handle.upgrade() else {
                 continue;
             };
+            let established_elsewhere = conn_state
+                .paths
+                .values()
+                .any(|path| !is_withdrawn_custom(path, &local));
             for path_id in conn_state.paths.keys() {
                 let Some(path) = conn.path(*path_id) else {
                     continue;
@@ -583,8 +593,13 @@ impl RemoteStateActor {
                             if !local.contains(&addr))
                     });
                 if withdrawn {
-                    debug!(%path_id, "closing custom path with a withdrawn local address");
-                    match path.close() {
+                    let closed = if established_elsewhere {
+                        debug!(%path_id, "closing custom path with a withdrawn local address");
+                        path.close()
+                    } else {
+                        Err(noq_proto::ClosePathError::LastOpenPath)
+                    };
+                    match closed {
                         Err(noq_proto::ClosePathError::LastOpenPath) => {
                             self.state
                                 .stuck_connections
